@@ -1,0 +1,436 @@
+---
+title: "679 final project code"
+format: pdf
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+```{r}
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(pdp)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+
+set.seed(679)
+```
+
+```{r}
+df <- read.csv("Food_Delivery_Times.csv")
+
+glimpse(df)
+summary(df)
+```
+
+```{r}
+missing_table <- data.frame(
+  Variable = names(colSums(is.na(df))),
+  Missing = as.numeric(colSums(is.na(df)))
+) %>%
+  filter(Missing > 0)
+
+missing_table %>%
+  kable(caption = "Missing value counts in raw dataset.") %>%
+  kable_styling(full_width = FALSE)
+
+sum(!complete.cases(df))
+
+sum(complete.cases(df))
+```
+
+```{r}
+df_clean <- df %>%
+  drop_na() %>%
+  mutate(
+    Weather = factor(Weather),
+    Traffic_Level = factor(Traffic_Level),
+    Time_of_Day = factor(Time_of_Day),
+    Vehicle_Type = factor(Vehicle_Type)
+  )
+
+nrow(df_clean)
+
+Q1 <- quantile(df_clean$Delivery_Time_min, 0.25)
+Q3 <- quantile(df_clean$Delivery_Time_min, 0.75)
+IQR_value <- IQR(df_clean$Delivery_Time_min)
+
+lower_bound <- Q1 - 1.5 * IQR_value
+upper_bound <- Q3 + 1.5 * IQR_value
+
+extreme_values <- df_clean %>%
+  filter(
+    Delivery_Time_min < lower_bound |
+      Delivery_Time_min > upper_bound
+  ) %>%
+  arrange(desc(Delivery_Time_min))
+
+extreme_values
+```
+
+```{r}
+set.seed(679)
+
+train_index <- createDataPartition(
+  df_clean$Delivery_Time_min,
+  p = 0.8,
+  list = FALSE
+)
+
+train_data <- df_clean[train_index, ]
+test_data  <- df_clean[-train_index, ]
+
+nrow(train_data)
+nrow(test_data)
+```
+
+```{r}
+p1 <- ggplot(df_clean, aes(x = Delivery_Time_min)) +
+  geom_histogram(bins = 35, fill = "steelblue", color = "white") +
+  labs(
+    title = "Delivery Time",
+    x = "Minutes",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+p2 <- ggplot(df_clean, aes(x = Weather, y = Delivery_Time_min, fill = Weather)) +
+  geom_boxplot(alpha = 0.8, show.legend = FALSE) +
+  labs(
+    title = "By Weather",
+    x = NULL,
+    y = "Delivery Time (min)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+
+p3 <- ggplot(df_clean, aes(x = Distance_km, y = Delivery_Time_min)) +
+  geom_point(alpha = 0.25) +
+  geom_smooth(method = "loess", se = FALSE) +
+  labs(
+    title = "Distance vs Time",
+    x = "Distance (km)",
+    y = "Delivery Time (min)"
+  ) +
+  theme_minimal()
+
+figure1 <- p1 + p2 + p3
+figure1
+```
+
+```{r}
+lm_fit <- lm(
+  Delivery_Time_min ~ Distance_km +
+    Preparation_Time_min +
+    Courier_Experience_yrs +
+    Weather +
+    Traffic_Level +
+    Time_of_Day +
+    Vehicle_Type,
+  data = train_data
+)
+
+summary(lm_fit)
+
+lm_pred <- predict(lm_fit, newdata = test_data)
+
+```
+
+```{r}
+set.seed(679)
+
+rf_fit <- randomForest(
+  Delivery_Time_min ~ Distance_km +
+    Preparation_Time_min +
+    Courier_Experience_yrs +
+    Weather +
+    Traffic_Level +
+    Time_of_Day +
+    Vehicle_Type,
+  data = train_data,
+  ntree = 500,
+  mtry = 3,
+  importance = TRUE
+)
+
+rf_fit
+
+rf_pred <- predict(rf_fit, newdata = test_data)
+```
+
+```{r}
+xgb_formula <- Delivery_Time_min ~ Distance_km +
+  Preparation_Time_min +
+  Courier_Experience_yrs +
+  Weather +
+  Traffic_Level +
+  Time_of_Day +
+  Vehicle_Type
+
+x_train <- model.matrix(xgb_formula, data = train_data)[, -1]
+y_train <- train_data$Delivery_Time_min
+
+x_test <- model.matrix(xgb_formula, data = test_data)[, -1]
+y_test <- test_data$Delivery_Time_min
+
+
+# Create validation split inside training data
+set.seed(679)
+
+valid_index <- createDataPartition(
+  y_train,
+  p = 0.2,
+  list = FALSE
+)
+
+x_valid <- x_train[valid_index, ]
+y_valid <- y_train[valid_index]
+
+x_train_sub <- x_train[-valid_index, ]
+y_train_sub <- y_train[-valid_index]
+
+dtrain <- xgb.DMatrix(data = x_train_sub, label = y_train_sub)
+dvalid <- xgb.DMatrix(data = x_valid, label = y_valid)
+dtest  <- xgb.DMatrix(data = x_test, label = y_test)
+```
+
+```{r}
+xgb_params <- list(
+  objective = "reg:squarederror",
+  eta = 0.05,
+  max_depth = 4,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+set.seed(679)
+
+xgb_fit <- xgb.train(
+  params = xgb_params,
+  data = dtrain,
+  nrounds = 1000,
+  watchlist = list(
+    train = dtrain,
+    validation = dvalid
+  ),
+  early_stopping_rounds = 30,
+  verbose = 0
+)
+
+xgb_fit$best_iteration
+
+xgb_pred <- predict(xgb_fit, dtest)
+```
+
+```{r}
+rmse_fun <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2))
+}
+
+mae_fun <- function(actual, predicted) {
+  mean(abs(actual - predicted))
+}
+
+r2_fun <- function(actual, predicted) {
+  1 - sum((actual - predicted)^2) / sum((actual - mean(actual))^2)
+}
+
+performance_table <- tibble(
+  Model = c(
+    "Linear Model",
+    "Random Forest",
+    "XGBoost"
+  ),
+  RMSE = c(
+    rmse_fun(y_test, lm_pred),
+    rmse_fun(y_test, rf_pred),
+    rmse_fun(y_test, xgb_pred)
+  ),
+  MAE = c(
+    mae_fun(y_test, lm_pred),
+    mae_fun(y_test, rf_pred),
+    mae_fun(y_test, xgb_pred)
+  ),
+  R2 = c(
+    r2_fun(y_test, lm_pred),
+    r2_fun(y_test, rf_pred),
+    r2_fun(y_test, xgb_pred)
+  )
+) %>%
+  mutate(
+    RMSE = round(RMSE, 3),
+    MAE = round(MAE, 3),
+    R2 = round(R2, 3)
+  )
+
+performance_table %>%
+  kable(caption = "Out-of-Sample Model Performance") %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+rf_importance <- importance(rf_fit, type = 1)
+
+rf_importance_df <- data.frame(
+  Variable = rownames(rf_importance),
+  IncMSE = rf_importance[, 1]
+) %>%
+  arrange(IncMSE) %>%
+  mutate(Variable = factor(Variable, levels = Variable))
+
+ggplot(rf_importance_df, aes(x = IncMSE, y = Variable)) +
+  geom_col(fill = "steelblue") +
+  labs(
+    title = "Random Forest Variable Importance",
+    x = "% Increase in MSE",
+    y = NULL
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+pdp_distance <- partial(
+  rf_fit,
+  pred.var = "Distance_km",
+  train = train_data
+)
+
+p_distance <- autoplot(pdp_distance) +
+  labs(
+    title = "Distance PDP",
+    x = "Distance (km)",
+    y = "Predicted Time (min)"
+  ) +
+  theme_minimal()
+
+# Preparation time PDP
+pdp_prep <- partial(
+  rf_fit,
+  pred.var = "Preparation_Time_min",
+  train = train_data
+)
+
+p_prep <- autoplot(pdp_prep) +
+  labs(
+    title = "Prep Time PDP",
+    x = "Prep Time (min)",
+    y = "Predicted Time (min)"
+  ) +
+  theme_minimal()
+
+# Distance x Weather PDP
+pdp_distance_weather <- partial(
+  rf_fit,
+  pred.var = c("Distance_km", "Weather"),
+  train = train_data
+)
+
+p_distance_weather <- ggplot(
+  pdp_distance_weather,
+  aes(
+    x = Distance_km,
+    y = yhat,
+    color = Weather
+  )
+) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "Distance x Weather",
+    x = "Distance (km)",
+    y = "Predicted Time (min)"
+  ) +
+  theme_minimal()
+
+figure3 <- p_distance + p_prep + p_distance_weather
+figure3
+```
+
+```{r}
+pred_df <- tibble(
+  Actual = rep(y_test, 3),
+  Predicted = c(lm_pred, rf_pred, xgb_pred),
+  Model = rep(
+    c("Linear Model", "Random Forest", "XGBoost"),
+    each = length(y_test)
+  )
+)
+
+ggplot(pred_df, aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.35) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "red"
+  ) +
+  facet_wrap(~ Model) +
+  labs(
+    title = "Predicted vs Actual Delivery Time",
+    x = "Actual (min)",
+    y = "Predicted (min)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+xgb_importance <- xgb.importance(
+  feature_names = colnames(x_train),
+  model = xgb_fit
+)
+
+xgb_importance
+
+# Group dummy variables back into original variable names
+xgb_importance_grouped <- xgb_importance %>%
+  mutate(
+    Original_Variable = case_when(
+      str_detect(Feature, "^Distance_km") ~ "Distance",
+      str_detect(Feature, "^Preparation_Time_min") ~ "Prep Time",
+      str_detect(Feature, "^Courier_Experience_yrs") ~ "Experience",
+      str_detect(Feature, "^Weather") ~ "Weather",
+      str_detect(Feature, "^Traffic_Level") ~ "Traffic Level",
+      str_detect(Feature, "^Time_of_Day") ~ "Time of Day",
+      str_detect(Feature, "^Vehicle_Type") ~ "Vehicle Type",
+      TRUE ~ Feature
+    )
+  ) %>%
+  group_by(Original_Variable) %>%
+  summarise(Gain = sum(Gain), .groups = "drop") %>%
+  arrange(Gain) %>%
+  mutate(Original_Variable = factor(Original_Variable, levels = Original_Variable))
+
+ggplot(xgb_importance_grouped, aes(x = Gain, y = Original_Variable)) +
+  geom_col(fill = "firebrick") +
+  labs(
+    title = "XGBoost Variable Importance",
+    x = "Gain",
+    y = NULL
+  ) +
+  theme_minimal()
+```
+
+```{r}
+oob_df <- tibble(
+  Number_of_Trees = 1:length(rf_fit$mse),
+  OOB_RMSE = sqrt(rf_fit$mse)
+)
+
+ggplot(oob_df, aes(x = Number_of_Trees, y = OOB_RMSE)) +
+  geom_line() +
+  labs(
+    title = "Random Forest OOB RMSE",
+    x = "Number of Trees",
+    y = "OOB RMSE"
+  ) +
+  theme_minimal()
+```
